@@ -12,6 +12,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Link as LinkIcon,
+  Sparkles,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -30,11 +31,33 @@ interface UploadedFile {
   error?: string;
 }
 
+type ExtractionPhase =
+  | "idle"
+  | "creating"
+  | "uploading"
+  | "parsing"
+  | "analyzing"
+  | "structuring"
+  | "done"
+  | "error";
+
 const STEPS = [
   { id: 1, label: "Project Info" },
   { id: 2, label: "Upload Files" },
-  { id: 3, label: "Review & Start" },
+  { id: 3, label: "Extract & Analyze" },
 ];
+
+const PHASE_MESSAGES: Record<ExtractionPhase, string> = {
+  idle: "",
+  creating: "Creating project…",
+  uploading: "Uploading documents…",
+  parsing: "Parsing documents…",
+  analyzing: "Analyzing content with Claude AI…",
+  structuring: "Structuring extracted data…",
+  done: "Extraction complete!",
+  error: "",
+};
+
 
 export default function NewProjectPage() {
   const router = useRouter();
@@ -46,25 +69,15 @@ export default function NewProjectPage() {
   const [bidDeadline, setBidDeadline] = useState("");
   const [files, setFiles] = useState<UploadedFile[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  // ── Step 1 ──────────────────────────────────────────────────────────────
-  function handleStep1Submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!projectName.trim()) return;
-    setStep(2);
-  }
+  const [phase, setPhase] = useState<ExtractionPhase>("idle");
+  const [extractError, setExtractError] = useState<string | null>(null);
 
-  // ── File handling ────────────────────────────────────────────────────────
+  // ── File helpers ──────────────────────────────────────────────────────────
   function addFiles(newFiles: FileList | null) {
     if (!newFiles) return;
     const pdfs = Array.from(newFiles).filter((f) => f.type === "application/pdf");
-    if (pdfs.length === 0) {
-      setError("Only PDF files are accepted.");
-      return;
-    }
-    setError(null);
+    if (pdfs.length === 0) return;
     setFiles((prev) => [
       ...prev,
       ...pdfs.map((f) => ({
@@ -93,28 +106,24 @@ export default function NewProjectPage() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
-  // ── Upload files to Supabase Storage ─────────────────────────────────────
+  // ── Upload files to Supabase Storage ────────────────────────────────────
   async function uploadFiles(userId: string, projectId: string): Promise<string[]> {
     const paths: string[] = [];
-
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       const path = `${userId}/${projectId}/${Date.now()}-${f.name}`;
-
       setFiles((prev) =>
         prev.map((item, idx) =>
-          idx === i ? { ...item, status: "uploading", progress: 10 } : item
+          idx === i ? { ...item, status: "uploading", progress: 30 } : item
         )
       );
-
       const { error } = await supabase.storage
         .from("project-files")
         .upload(path, f.file, { contentType: "application/pdf" });
-
       if (error) {
         setFiles((prev) =>
           prev.map((item, idx) =>
-            idx === i ? { ...item, status: "error", error: error.message } : item
+            idx === i ? { ...item, status: "error", error: error.message, progress: 0 } : item
           )
         );
       } else {
@@ -126,23 +135,35 @@ export default function NewProjectPage() {
         paths.push(path);
       }
     }
-
     return paths;
   }
 
-  // ── Create project ────────────────────────────────────────────────────────
-  async function handleCreate() {
-    setCreating(true);
-    setError(null);
+  // ── Animate phase messages ─────────────────────────────────────────────
+  function startPhaseAnimation(
+    onPhaseChange: (p: ExtractionPhase) => void
+  ): NodeJS.Timeout[] {
+    const timers: NodeJS.Timeout[] = [];
+    // parsing: 0s, analyzing: 2s, structuring: 8s
+    const delays = [0, 2000, 8000];
+    const phases: ExtractionPhase[] = ["parsing", "analyzing", "structuring"];
+    phases.forEach((p, i) => {
+      timers.push(setTimeout(() => onPhaseChange(p), delays[i]));
+    });
+    return timers;
+  }
 
+  // ── Main create + extract flow ────────────────────────────────────────────
+  async function handleCreateAndExtract() {
+    setExtractError(null);
+    setPhase("creating");
     try {
       const {
         data: { user },
       } = await supabase.auth.getUser();
       if (!user) throw new Error("Not authenticated");
 
-      // First create the project record
-      const { data: project, error: insertError } = await supabase
+      // 1. Create project
+      const { data: project, error: insertErr } = await supabase
         .from("projects")
         .insert({
           user_id: user.id,
@@ -154,33 +175,70 @@ export default function NewProjectPage() {
         .select()
         .single();
 
-      if (insertError) throw insertError;
+      if (insertErr || !project) throw new Error(insertErr?.message ?? "Could not create project");
 
-      // Upload files if any
+      // 2. Upload files
       let storagePaths: string[] = [];
       if (files.length > 0) {
+        setPhase("uploading");
         storagePaths = await uploadFiles(user.id, project.id);
-
-        // Update project with file paths
-        await supabase
-          .from("projects")
-          .update({ source_files: storagePaths })
-          .eq("id", project.id);
+        if (storagePaths.length > 0) {
+          await supabase
+            .from("projects")
+            .update({ source_files: storagePaths })
+            .eq("id", project.id);
+        }
       }
 
-      router.push(`/`);
+      // 3. If no files, just go to detail page as draft
+      if (storagePaths.length === 0) {
+        router.push(`/projects/${project.id}`);
+        return;
+      }
+
+      // 4. Animate messages while extraction runs
+      const timers = startPhaseAnimation(setPhase);
+
+      const res = await fetch("/api/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+
+      timers.forEach(clearTimeout);
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? "Extraction failed");
+      }
+
+      setPhase("done");
+      await new Promise((r) => setTimeout(r, 800));
+      router.push(`/projects/${project.id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
-      setCreating(false);
+      setPhase("error");
+      setExtractError(err instanceof Error ? err.message : "Something went wrong.");
     }
   }
 
-  const canProceedStep1 = projectName.trim().length > 0;
-  const canCreate = !creating;
+  const isExtracting = ["creating", "uploading", "parsing", "analyzing", "structuring"].includes(
+    phase
+  );
 
+  const phaseProgress: Record<ExtractionPhase, number> = {
+    idle: 0,
+    creating: 8,
+    uploading: 20,
+    parsing: 40,
+    analyzing: 65,
+    structuring: 88,
+    done: 100,
+    error: 0,
+  };
+
+  // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="max-w-2xl mx-auto">
-      {/* Header */}
       <div className="mb-8">
         <h1 className="text-2xl font-bold text-navy">New Project</h1>
         <p className="text-gray-500 text-sm mt-0.5">Create a new RFP analysis project</p>
@@ -226,16 +284,16 @@ export default function NewProjectPage() {
 
       {/* Card */}
       <div className="bg-white rounded-2xl border border-gray-200 shadow-sm p-8">
-        {error && (
-          <div className="mb-6 flex items-start gap-2.5 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
-            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
-            <span>{error}</span>
-          </div>
-        )}
 
-        {/* ── Step 1: Project Info ─────────────────────────────────────── */}
+        {/* ── Step 1: Project Info ──────────────────────────────────────── */}
         {step === 1 && (
-          <form onSubmit={handleStep1Submit} className="space-y-6">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (projectName.trim()) setStep(2);
+            }}
+            className="space-y-6"
+          >
             <div className="space-y-1.5">
               <Label htmlFor="name">Project Name *</Label>
               <Input
@@ -247,7 +305,6 @@ export default function NewProjectPage() {
                 required
               />
             </div>
-
             <div className="space-y-1.5">
               <Label htmlFor="deadline">Bid Deadline</Label>
               <Input
@@ -257,7 +314,6 @@ export default function NewProjectPage() {
                 onChange={(e) => setBidDeadline(e.target.value)}
               />
             </div>
-
             <div className="space-y-1.5">
               <Label htmlFor="url">BidNet / Source URL (optional)</Label>
               <div className="relative">
@@ -272,9 +328,8 @@ export default function NewProjectPage() {
                 />
               </div>
             </div>
-
             <div className="flex justify-end pt-2">
-              <Button type="submit" disabled={!canProceedStep1} className="gap-2">
+              <Button type="submit" disabled={!projectName.trim()} className="gap-2">
                 Next: Upload Files
                 <ChevronRight className="w-4 h-4" />
               </Button>
@@ -282,10 +337,9 @@ export default function NewProjectPage() {
           </form>
         )}
 
-        {/* ── Step 2: File Upload ──────────────────────────────────────── */}
+        {/* ── Step 2: File Upload ───────────────────────────────────────── */}
         {step === 2 && (
           <div className="space-y-6">
-            {/* Drop zone */}
             <div
               onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
               onDragLeave={() => setIsDragOver(false)}
@@ -309,151 +363,200 @@ export default function NewProjectPage() {
               <div className="w-12 h-12 bg-navy/10 rounded-xl flex items-center justify-center mx-auto mb-3">
                 <Upload className="w-6 h-6 text-navy" />
               </div>
-              <p className="font-semibold text-navy text-sm">
-                Drop PDF files here or click to browse
-              </p>
-              <p className="text-xs text-gray-400 mt-1">
-                Multiple PDFs accepted — RFPs, addenda, supporting documents
-              </p>
+              <p className="font-semibold text-navy text-sm">Drop PDF files here or click to browse</p>
+              <p className="text-xs text-gray-400 mt-1">RFPs, addenda, supporting documents</p>
             </div>
 
-            {/* File list */}
             {files.length > 0 && (
               <div className="space-y-2">
                 <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
-                  {files.length} file{files.length !== 1 ? "s" : ""} queued
+                  {files.length} file{files.length !== 1 ? "s" : ""} selected
                 </p>
                 {files.map((f, i) => (
-                  <div
-                    key={i}
-                    className="flex items-center gap-3 bg-gray-50 rounded-lg px-3 py-2.5"
-                  >
+                  <div key={i} className="flex items-center gap-3 bg-gray-50 rounded-lg px-3 py-2.5">
                     <FileText className="w-4 h-4 text-navy shrink-0" />
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-navy truncate">{f.name}</p>
-                      <div className="flex items-center gap-2 mt-1">
-                        <span className="text-xs text-gray-400">{formatSize(f.size)}</span>
-                        {f.status === "uploading" && (
-                          <Progress value={f.progress} className="h-1 w-20" />
-                        )}
-                        {f.status === "done" && (
-                          <span className="text-xs text-green font-medium">Uploaded</span>
-                        )}
-                        {f.status === "error" && (
-                          <span className="text-xs text-red-500">{f.error}</span>
-                        )}
-                      </div>
+                      <p className="text-xs text-gray-400">{formatSize(f.size)}</p>
                     </div>
-                    {f.status === "pending" && (
-                      <button
-                        onClick={() => removeFile(i)}
-                        className="text-gray-400 hover:text-red-500 transition-colors"
-                      >
-                        <X className="w-4 h-4" />
-                      </button>
-                    )}
-                    {f.status === "done" && (
-                      <CheckCircle2 className="w-4 h-4 text-green shrink-0" />
-                    )}
+                    <button
+                      onClick={() => removeFile(i)}
+                      className="text-gray-400 hover:text-red-500 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
                   </div>
                 ))}
               </div>
             )}
 
             <div className="flex items-center justify-between pt-2">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStep(1)}
-                className="gap-2"
-              >
+              <Button type="button" variant="ghost" onClick={() => setStep(1)} className="gap-2">
                 <ChevronLeft className="w-4 h-4" />
                 Back
               </Button>
-              <Button
-                type="button"
-                onClick={() => setStep(3)}
-                className="gap-2"
-              >
-                Next: Review
+              <Button type="button" onClick={() => setStep(3)} className="gap-2">
+                Next: Extract & Analyze
                 <ChevronRight className="w-4 h-4" />
               </Button>
             </div>
           </div>
         )}
 
-        {/* ── Step 3: Review & Create ──────────────────────────────────── */}
+        {/* ── Step 3: Extract & Analyze ─────────────────────────────────── */}
         {step === 3 && (
           <div className="space-y-6">
-            <h2 className="font-semibold text-navy">Review your project</h2>
-
-            {/* Summary */}
-            <div className="bg-gray-50 rounded-xl divide-y divide-gray-200">
-              <div className="flex items-start gap-3 px-4 py-3">
-                <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Project Name</span>
-                <span className="text-sm font-medium text-navy">{projectName}</span>
-              </div>
-              <div className="flex items-start gap-3 px-4 py-3">
-                <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Deadline</span>
-                <span className="text-sm text-navy">
-                  {bidDeadline
-                    ? new Date(bidDeadline).toLocaleString("en-CA")
-                    : "Not set"}
-                </span>
-              </div>
-              <div className="flex items-start gap-3 px-4 py-3">
-                <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Source URL</span>
-                <span className="text-sm text-navy break-all">
-                  {sourceUrl || "Not provided"}
-                </span>
-              </div>
-              <div className="flex items-start gap-3 px-4 py-3">
-                <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Files</span>
-                <span className="text-sm text-navy">
-                  {files.length > 0
-                    ? `${files.length} PDF file${files.length !== 1 ? "s" : ""}`
-                    : "No files attached"}
-                </span>
-              </div>
-            </div>
-
-            {files.length > 0 && (
-              <div className="bg-navy/5 border border-navy/10 rounded-lg p-3 text-sm text-navy">
-                <strong>Next step:</strong> After creating, click &quot;Extract &amp; Analyze&quot; to process your RFP documents with Claude AI.
+            {/* Extraction progress — shown while running */}
+            {isExtracting && (
+              <div className="space-y-4">
+                <div className="flex items-center gap-3">
+                  <Loader2 className="w-5 h-5 text-navy animate-spin shrink-0" />
+                  <span className="text-sm font-medium text-navy">
+                    {PHASE_MESSAGES[phase]}
+                  </span>
+                </div>
+                <Progress value={phaseProgress[phase]} className="h-1.5" />
+                <div className="space-y-2">
+                  {(["parsing", "analyzing", "structuring"] as const).map((p) => {
+                    const phases: ExtractionPhase[] = ["parsing", "analyzing", "structuring"];
+                    const currentIdx = phases.indexOf(phase);
+                    const thisIdx = phases.indexOf(p);
+                    const isDone = currentIdx > thisIdx;
+                    const isActive = currentIdx === thisIdx;
+                    return (
+                      <div key={p} className="flex items-center gap-2.5 text-xs">
+                        <div
+                          className={cn(
+                            "w-4 h-4 rounded-full flex items-center justify-center shrink-0",
+                            isDone ? "bg-green" : isActive ? "bg-navy animate-pulse" : "bg-gray-200"
+                          )}
+                        >
+                          {isDone && <CheckCircle2 className="w-3 h-3 text-white" />}
+                        </div>
+                        <span
+                          className={cn(
+                            isDone ? "text-gray-500 line-through" : isActive ? "text-navy font-medium" : "text-gray-400"
+                          )}
+                        >
+                          {p === "parsing" && "Parsing documents"}
+                          {p === "analyzing" && "Analyzing content with Claude AI"}
+                          {p === "structuring" && "Structuring extracted data"}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
-            <div className="flex items-center justify-between pt-2">
-              <Button
-                type="button"
-                variant="ghost"
-                onClick={() => setStep(2)}
-                className="gap-2"
-                disabled={creating}
-              >
-                <ChevronLeft className="w-4 h-4" />
-                Back
-              </Button>
-              <Button
-                type="button"
-                variant="accent"
-                onClick={handleCreate}
-                disabled={!canCreate}
-                className="gap-2"
-              >
-                {creating ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    {files.length > 0 ? "Uploading & Creating…" : "Creating…"}
-                  </>
-                ) : (
-                  <>
-                    <CheckCircle2 className="w-4 h-4" />
-                    Create Project
-                  </>
+            {/* Success flash */}
+            {phase === "done" && (
+              <div className="flex items-center gap-3 bg-green/10 border border-green/20 rounded-xl p-4">
+                <CheckCircle2 className="w-5 h-5 text-green shrink-0" />
+                <span className="text-sm font-medium text-green">
+                  Extraction complete — opening project…
+                </span>
+              </div>
+            )}
+
+            {/* Error state */}
+            {phase === "error" && extractError && (
+              <div className="space-y-4">
+                <div className="flex items-start gap-2.5 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+                  <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                  <div>
+                    <p className="font-semibold mb-0.5">Extraction failed</p>
+                    <p>{extractError}</p>
+                    <p className="mt-1 text-xs text-red-500">
+                      You can still save the project and enter data manually.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Idle: review summary + CTA */}
+            {phase === "idle" && (
+              <div className="space-y-4">
+                <h2 className="font-semibold text-navy">Review &amp; start extraction</h2>
+                <div className="bg-gray-50 rounded-xl divide-y divide-gray-200">
+                  <div className="flex items-start gap-3 px-4 py-3">
+                    <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Project</span>
+                    <span className="text-sm font-medium text-navy">{projectName}</span>
+                  </div>
+                  <div className="flex items-start gap-3 px-4 py-3">
+                    <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Deadline</span>
+                    <span className="text-sm text-navy">
+                      {bidDeadline ? new Date(bidDeadline).toLocaleString("en-CA") : "Not set"}
+                    </span>
+                  </div>
+                  <div className="flex items-start gap-3 px-4 py-3">
+                    <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Files</span>
+                    <span className="text-sm text-navy">
+                      {files.length > 0
+                        ? `${files.length} PDF file${files.length !== 1 ? "s" : ""}`
+                        : "No files — will save as draft"}
+                    </span>
+                  </div>
+                  {sourceUrl && (
+                    <div className="flex items-start gap-3 px-4 py-3">
+                      <span className="text-xs text-gray-400 w-28 pt-0.5 shrink-0">Source URL</span>
+                      <span className="text-sm text-navy break-all">{sourceUrl}</span>
+                    </div>
+                  )}
+                </div>
+
+                {files.length > 0 && (
+                  <div className="flex items-start gap-2.5 bg-navy/5 border border-navy/10 rounded-lg p-3 text-xs text-navy/70">
+                    <Sparkles className="w-3.5 h-3.5 mt-0.5 shrink-0 text-navy" />
+                    Claude will extract up to 30 procurement fields from your documents. The process takes 20–60 seconds.
+                  </div>
                 )}
-              </Button>
-            </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            {(phase === "idle" || phase === "error") && (
+              <div className="flex items-center justify-between pt-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setPhase("idle");
+                    setExtractError(null);
+                    setStep(2);
+                  }}
+                  className="gap-2"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                  Back
+                </Button>
+                <div className="flex gap-2">
+                  {phase === "error" && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        // Navigate to the partially-created project
+                        router.push("/");
+                      }}
+                      className="gap-2"
+                    >
+                      Go to Dashboard
+                    </Button>
+                  )}
+                  <Button
+                    type="button"
+                    variant="accent"
+                    onClick={handleCreateAndExtract}
+                    className="gap-2"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    {files.length > 0 ? "Create & Extract" : "Create Project"}
+                  </Button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

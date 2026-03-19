@@ -19,6 +19,8 @@ import {
   ChevronDown,
   ChevronUp,
   RefreshCw,
+  Share2,
+  StickyNote,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -604,6 +606,32 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
 
         {/* ── Right panel (40%) ─────────────────────────────────────────── */}
         <div className="flex-[2] min-w-0 space-y-4">
+          {/* Quick links */}
+          <div className="grid grid-cols-2 gap-2">
+            <Link href={`/projects/${project.id}/social`} className="block">
+              <div className="bg-white border border-gray-200 rounded-xl p-3 hover:border-navy/40 hover:bg-navy/5 transition-colors flex items-center gap-2.5">
+                <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shrink-0">
+                  <Share2 className="w-3.5 h-3.5 text-white" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-navy">Social Media</p>
+                  <p className="text-[10px] text-gray-400">IG · FB · TikTok</p>
+                </div>
+              </div>
+            </Link>
+            <Link href={`/projects/${project.id}/notes`} className="block">
+              <div className="bg-white border border-gray-200 rounded-xl p-3 hover:border-navy/40 hover:bg-navy/5 transition-colors flex items-center gap-2.5">
+                <div className="w-7 h-7 rounded-lg bg-navy flex items-center justify-center shrink-0">
+                  <StickyNote className="w-3.5 h-3.5 text-white" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-navy">Team Notes</p>
+                  <p className="text-[10px] text-gray-400">Tips · Notes</p>
+                </div>
+              </div>
+            </Link>
+          </div>
+
           {/* Tabs */}
           <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
             <div className="flex border-b border-gray-200">
@@ -747,7 +775,7 @@ function ProjectHeader({
         </div>
         <h1 className="text-xl font-bold text-navy leading-snug">{project.title}</h1>
       </div>
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
         {saveMessage && (
           <span
             className={cn(
@@ -763,6 +791,18 @@ function ProjectHeader({
             {saveMessage}
           </span>
         )}
+        <Link href={`/projects/${project.id}/social`}>
+          <Button variant="outline" size="sm" className="gap-2">
+            <Share2 className="w-4 h-4" />
+            Social Copy
+          </Button>
+        </Link>
+        <Link href={`/projects/${project.id}/notes`}>
+          <Button variant="outline" size="sm" className="gap-2">
+            <StickyNote className="w-4 h-4" />
+            Team Notes
+          </Button>
+        </Link>
         <Button
           variant="outline"
           size="sm"

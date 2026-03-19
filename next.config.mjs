@@ -2,8 +2,7 @@
 const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: [
-      "pdf-parse",
-      "pdf-parse/node",
+      "pdfjs-dist",
       "pdfkit",
       "canvas",
       "pdf-to-img",

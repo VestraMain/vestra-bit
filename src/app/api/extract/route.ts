@@ -3,11 +3,10 @@ import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 import Anthropic from "@anthropic-ai/sdk";
 
-// Use Node.js runtime (required for pdf-parse)
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
-// ── Supabase admin client (service role not needed here — user auth) ──────────
+// ── Supabase client ───────────────────────────────────────────────────────────
 async function getSupabaseClient() {
   const cookieStore = await cookies();
   return createServerClient(
@@ -70,26 +69,58 @@ const EXTRACTION_SCHEMA = `{
   "submission_forms_required": "List of required submission forms as string, or null"
 }`;
 
-// ── PDF text extraction ──────────────────────────────────────────────────────
-async function extractPdfText(buffer: Buffer): Promise<string> {
-  // pdf-parse v2+ uses a class-based API
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { PDFParse } = require("pdf-parse");
-  const parser = new PDFParse({ data: new Uint8Array(buffer) });
-  const result = await parser.getText();
-  // getText() returns an object with pages array; join all page text
-  if (result && typeof result === "object" && Array.isArray(result.pages)) {
-    return result.pages.map((p: { text?: string }) => p.text ?? "").join("\n");
+// ── pdfjs-dist text extraction ────────────────────────────────────────────────
+// Uses pdfjs-dist legacy build (same package pdf-to-img relies on).
+// Resolves the worker path via createRequire so it works on Vercel where
+// __dirname is not a static file path.
+async function extractPdfText(buffer: Buffer, label: string): Promise<string> {
+  const { createRequire } = await import("module");
+  const path = await import("path");
+
+  // Dynamic import of the ESM-only pdfjs-dist legacy build
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+  // Resolve worker path the same way pdf-to-img does
+  const r = createRequire(import.meta.url);
+  const pdfjsBase = path.dirname(r.resolve("pdfjs-dist/package.json"));
+  pdfjs.GlobalWorkerOptions.workerSrc = `${pdfjsBase}/legacy/build/pdf.worker.mjs`;
+
+  console.log(`[extract] Loading PDF "${label}" (${buffer.byteLength} bytes)`);
+
+  const loadingTask = pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    // Suppress the "Indexing all PDF objects" warning in logs
+    verbosity: 0,
+  });
+
+  const doc = await loadingTask.promise;
+  const numPages = doc.numPages;
+  console.log(`[extract] "${label}" has ${numPages} page(s)`);
+
+  const pageTexts: string[] = [];
+  for (let i = 1; i <= numPages; i++) {
+    const page = await doc.getPage(i);
+    const textContent = await page.getTextContent();
+    const pageText = textContent.items
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((item: any) => ("str" in item ? (item.str as string) : ""))
+      .join(" ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    pageTexts.push(pageText);
   }
-  if (result && typeof result.text === "string") return result.text;
-  return String(result ?? "");
+
+  const fullText = pageTexts.join("\n");
+  console.log(
+    `[extract] "${label}" extracted ${fullText.length} chars across ${numPages} pages`
+  );
+  return fullText;
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
 export async function POST(req: NextRequest) {
   const supabase = await getSupabaseClient();
 
-  // Auth check
   const {
     data: { user },
   } = await supabase.auth.getUser();
@@ -103,7 +134,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "projectId is required" }, { status: 400 });
   }
 
-  // Fetch project (ownership verified via RLS)
+  console.log(`[extract] Starting extraction for project ${projectId}`);
+
   const { data: project, error: fetchErr } = await supabase
     .from("projects")
     .select("*")
@@ -111,12 +143,15 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (fetchErr || !project) {
+    console.error(`[extract] Project not found: ${fetchErr?.message}`);
     return NextResponse.json({ error: "Project not found" }, { status: 404 });
   }
 
   if (!project.source_files || project.source_files.length === 0) {
     return NextResponse.json({ error: "No source files to extract from" }, { status: 400 });
   }
+
+  console.log(`[extract] Found ${project.source_files.length} source file(s)`);
 
   // Mark as extracting
   await supabase
@@ -125,37 +160,64 @@ export async function POST(req: NextRequest) {
     .eq("id", projectId);
 
   try {
-    // ── Step 1: Download + parse all PDFs ──────────────────────────────────
+    // ── Step 1: Download + extract text from each PDF ──────────────────────
     const textChunks: string[] = [];
+    const fileErrors: string[] = [];
 
     for (const filePath of project.source_files as string[]) {
+      const filename = filePath.split("/").pop() ?? filePath;
+      console.log(`[extract] Downloading file: ${filePath}`);
+
       const { data: fileData, error: dlErr } = await supabase.storage
         .from("project-files")
         .download(filePath);
 
       if (dlErr || !fileData) {
-        console.warn(`Could not download ${filePath}:`, dlErr?.message);
+        const msg = `Download failed for "${filename}": ${dlErr?.message ?? "no data returned"}`;
+        console.error(`[extract] ${msg}`);
+        fileErrors.push(msg);
         continue;
       }
 
       const buffer = Buffer.from(await fileData.arrayBuffer());
+      console.log(`[extract] Downloaded "${filename}" — ${buffer.byteLength} bytes`);
+
       try {
-        const text = await extractPdfText(buffer);
-        const filename = filePath.split("/").pop() ?? filePath;
-        textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
+        const text = await extractPdfText(buffer, filename);
+        if (!text || text.trim().length === 0) {
+          const msg = `"${filename}" yielded empty text (scanned/image-only PDF?)`;
+          console.warn(`[extract] ${msg}`);
+          fileErrors.push(msg);
+          // Still include a placeholder so Claude knows the file existed
+          textChunks.push(`\n\n--- FILE: ${filename} ---\n[No extractable text — may be a scanned image PDF]`);
+        } else {
+          textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
+        }
       } catch (parseErr) {
-        console.warn(`Could not parse PDF ${filePath}:`, parseErr);
+        const msg = `PDF parse error for "${filename}": ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`;
+        console.error(`[extract] ${msg}`);
+        fileErrors.push(msg);
+        // Continue with other files
       }
     }
 
     if (textChunks.length === 0) {
-      throw new Error("Could not extract text from any of the uploaded files.");
+      throw new Error(
+        `Could not extract text from any of the ${project.source_files.length} file(s). ` +
+          `Errors: ${fileErrors.join(" | ")}`
+      );
     }
 
     // Concatenate and truncate to stay within Claude's context window
     const combined = textChunks.join("\n").slice(0, 180_000);
+    console.log(
+      `[extract] Total combined text: ${combined.length} chars from ${textChunks.length}/${project.source_files.length} files. ` +
+        (fileErrors.length ? `Partial errors: ${fileErrors.join(" | ")}` : "No errors.")
+    );
 
     // ── Step 2: Call Claude ─────────────────────────────────────────────────
+    console.log(`[extract] Sending ${combined.length} chars to Claude`);
+
     const anthropic = new Anthropic({
       apiKey: process.env.ANTHROPIC_API_KEY,
     });
@@ -182,10 +244,11 @@ export async function POST(req: NextRequest) {
       ],
     });
 
+    console.log(`[extract] Claude responded. Stop reason: ${message.stop_reason}`);
+
     // ── Step 3: Parse + validate Claude's response ─────────────────────────
     const raw = message.content[0].type === "text" ? message.content[0].text : "";
 
-    // Strip any accidental markdown fences
     const cleaned = raw
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
@@ -200,7 +263,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Ensure required array fields exist
     if (!Array.isArray(extracted.work_items)) extracted.work_items = [];
     if (!Array.isArray(extracted.insurance_requirements)) extracted.insurance_requirements = [];
 
@@ -210,29 +272,28 @@ export async function POST(req: NextRequest) {
       .update({
         extracted_data: extracted,
         status: "review",
-        // Sync bid_deadline from extracted data if not already set
         ...(extracted.bid_deadline && !project.bid_deadline
-          ? { bid_deadline: null } // keep existing; deadline stays in extracted_data
+          ? { bid_deadline: null }
           : {}),
       })
       .eq("id", projectId);
 
-    if (updateErr) throw new Error(updateErr.message);
+    if (updateErr) throw new Error(`DB update failed: ${updateErr.message}`);
 
+    console.log(`[extract] Done. Project ${projectId} → status: review`);
     return NextResponse.json({ success: true, extracted_data: extracted });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "Extraction failed";
-    console.error("[extract]", message);
+    const errMsg = err instanceof Error ? err.message : "Extraction failed";
+    console.error(`[extract] FATAL error for project ${projectId}:`, errMsg);
 
-    // Revert status to draft so user can retry
     await supabase
       .from("projects")
       .update({
         status: "draft",
-        extracted_data: { _extraction_error: message },
+        extracted_data: { _extraction_error: errMsg },
       })
       .eq("id", projectId);
 
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: errMsg }, { status: 500 });
   }
 }

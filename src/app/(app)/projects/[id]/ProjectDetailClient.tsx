@@ -2,12 +2,16 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
+
 import {
   Save,
   FileText,
   Loader2,
   CheckCircle2,
   AlertCircle,
+  Package,
+  ImageIcon,
   ExternalLink,
   Sparkles,
   Plus,
@@ -642,15 +646,7 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
 
               {/* Outputs tab */}
               {rightTab === "outputs" && (
-                <div className="text-center py-8">
-                  <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-3">
-                    <FileText className="w-6 h-6 text-gray-400" />
-                  </div>
-                  <p className="text-sm text-gray-500 font-medium">No outputs yet</p>
-                  <p className="text-xs text-gray-400 mt-1">
-                    Generate a brief to create outputs.
-                  </p>
-                </div>
+                <OutputsPanel project={project} supabase={supabase} />
               )}
 
               {/* Status tab */}
@@ -839,5 +835,144 @@ function DownloadButton({
     >
       <ExternalLink className="w-3.5 h-3.5" />
     </button>
+  );
+}
+
+// ── Outputs panel ─────────────────────────────────────────────────────────────
+type OutputFiles = {
+  en_pdf?: string;
+  es_pdf?: string;
+  en_p1_jpg?: string;
+  en_p2_jpg?: string;
+  es_p1_jpg?: string;
+  es_p2_jpg?: string;
+};
+
+function OutputsPanel({
+  project,
+  supabase,
+}: {
+  project: Project;
+  supabase: ReturnType<typeof createClient>;
+}) {
+  const [exportingJpg, setExportingJpg] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const outputs = (project.output_files as OutputFiles) ?? {};
+  const hasAny = Object.keys(outputs).some((k) => outputs[k as keyof OutputFiles]);
+
+  const FILE_LABELS: Record<string, string> = {
+    en_pdf:    "English Brief (PDF)",
+    es_pdf:    "Spanish Brief (PDF)",
+    en_p1_jpg: "EN — Page 1 JPG (300 DPI)",
+    en_p2_jpg: "EN — Page 2 JPG (300 DPI)",
+    es_p1_jpg: "ES — Page 1 JPG (300 DPI)",
+    es_p2_jpg: "ES — Page 2 JPG (300 DPI)",
+  };
+
+  async function handleExportJpg() {
+    setExportingJpg(true);
+    setMsg(null);
+    try {
+      const res = await fetch("/api/export-jpg", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.error ?? "Export failed");
+      setMsg(body.errors?.length ? `Done with warnings` : "JPGs exported!");
+    } catch (err) {
+      setMsg("Error: " + (err instanceof Error ? err.message : "Unknown"));
+    } finally {
+      setExportingJpg(false);
+      setTimeout(() => setMsg(null), 5000);
+    }
+  }
+
+  async function handleDownloadZip() {
+    const res = await fetch("/api/download-zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId: project.id }),
+    });
+    if (!res.ok) { setMsg("ZIP failed"); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${project.id.slice(0, 8)}-vestra-brief.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  if (!hasAny) {
+    return (
+      <div className="text-center py-8">
+        <div className="w-12 h-12 bg-gray-100 rounded-xl flex items-center justify-center mx-auto mb-3">
+          <FileText className="w-6 h-6 text-gray-400" />
+        </div>
+        <p className="text-sm text-gray-500 font-medium">No outputs yet</p>
+        <p className="text-xs text-gray-400 mt-1">Generate a brief to create outputs.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      {msg && (
+        <p className={cn("text-xs font-medium", msg.startsWith("Error") ? "text-red-500" : "text-green")}>
+          {msg}
+        </p>
+      )}
+
+      {/* File list */}
+      <div className="space-y-1.5">
+        {Object.entries(FILE_LABELS).map(([key, label]) => {
+          const path = outputs[key as keyof OutputFiles];
+          if (!path) return null;
+          return (
+            <div key={key} className="flex items-center gap-2 bg-gray-50 rounded-lg px-2.5 py-2">
+              <FileText className="w-3.5 h-3.5 text-navy shrink-0" />
+              <span className="text-xs text-navy flex-1 truncate">{label}</span>
+              <DownloadButton supabase={supabase} path={path} />
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Action buttons */}
+      <div className="space-y-1.5 pt-1 border-t border-gray-100">
+        <Link href={`/projects/${project.id}/preview`} className="block">
+          <Button variant="outline" size="sm" className="w-full gap-2 text-xs">
+            <ExternalLink className="w-3.5 h-3.5" />
+            Open Full Preview
+          </Button>
+        </Link>
+
+        {(outputs.en_pdf || outputs.es_pdf) && (
+          <Button
+            variant="outline" size="sm" className="w-full gap-2 text-xs"
+            onClick={handleExportJpg}
+            disabled={exportingJpg}
+          >
+            {exportingJpg
+              ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              : <ImageIcon className="w-3.5 h-3.5" />}
+            {exportingJpg ? "Exporting…" : "Export JPGs (300 DPI)"}
+          </Button>
+        )}
+
+        {hasAny && (
+          <Button
+            variant="outline" size="sm" className="w-full gap-2 text-xs"
+            onClick={handleDownloadZip}
+          >
+            <Package className="w-3.5 h-3.5" />
+            Download All (ZIP)
+          </Button>
+        )}
+      </div>
+    </div>
   );
 }

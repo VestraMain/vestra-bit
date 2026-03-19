@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useRouter } from "next/navigation";
 import {
   Save,
   FileText,
@@ -171,6 +172,7 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
   );
   const [saving, setSaving] = useState(false);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
   const [rightTab, setRightTab] = useState<RightPanelTab>("files");
   const [msgIdx, setMsgIdx] = useState(0);
 
@@ -250,6 +252,33 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
     setTimeout(() => setSaveMessage(null), 3000);
   }, [supabase, data, project.id]);
 
+  // ── Generate Brief ────────────────────────────────────────────────────────
+  const router = useRouter();
+  // Keep a stable ref so the closure in the button callback stays fresh
+  const routerRef = useRef(router);
+  routerRef.current = router;
+
+  const handleGenerateBrief = useCallback(async () => {
+    setGenerating(true);
+    try {
+      const res = await fetch("/api/generate-brief", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: project.id }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error((body as { error?: string }).error ?? "Generation failed");
+      }
+      setProject((p) => ({ ...p, status: "complete" }));
+      routerRef.current.push(`/projects/${project.id}/preview`);
+    } catch (err) {
+      setGenerating(false);
+      setSaveMessage("Brief failed: " + (err instanceof Error ? err.message : "Unknown error"));
+      setTimeout(() => setSaveMessage(null), 5000);
+    }
+  }, [project.id]);
+
   // ── Field helpers ─────────────────────────────────────────────────────────
   function field(key: keyof ExtractedData): string {
     const v = data[key];
@@ -310,7 +339,7 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
   if (project.status === "extracting") {
     return (
       <div className="max-w-6xl mx-auto">
-        <ProjectHeader project={project} onSave={handleSave} saving={saving} saveMessage={saveMessage} />
+        <ProjectHeader project={project} onSave={handleSave} saving={saving} saveMessage={saveMessage} onGenerateBrief={handleGenerateBrief} generating={generating} />
         <div className="flex items-center justify-center min-h-[50vh]">
           <div className="text-center max-w-sm">
             <div className="w-16 h-16 bg-navy/10 rounded-2xl flex items-center justify-center mx-auto mb-5">
@@ -348,9 +377,11 @@ export default function ProjectDetailClient({ initial }: { initial: Project }) {
     <div className="max-w-7xl mx-auto">
       <ProjectHeader
         project={project}
-               onSave={handleSave}
+        onSave={handleSave}
         saving={saving}
         saveMessage={saveMessage}
+        onGenerateBrief={handleGenerateBrief}
+        generating={generating}
       />
 
       {extractionError && (
@@ -698,12 +729,17 @@ function ProjectHeader({
   onSave,
   saving,
   saveMessage,
+  onGenerateBrief,
+  generating,
 }: {
   project: Project;
   onSave: () => void;
   saving: boolean;
   saveMessage: string | null;
+  onGenerateBrief: () => void;
+  generating: boolean;
 }) {
+  const canGenerate = project.status === "review" || project.status === "complete";
   return (
     <div className="flex items-start justify-between mb-6 gap-4">
       <div className="min-w-0">
@@ -720,7 +756,7 @@ function ProjectHeader({
           <span
             className={cn(
               "text-xs font-medium flex items-center gap-1",
-              saveMessage === "Saved" ? "text-green" : "text-red-500"
+              saveMessage.startsWith("Save") || saveMessage === "Saved" ? "text-green" : "text-red-500"
             )}
           >
             {saveMessage === "Saved" ? (
@@ -735,7 +771,7 @@ function ProjectHeader({
           variant="outline"
           size="sm"
           onClick={onSave}
-          disabled={saving}
+          disabled={saving || generating}
           className="gap-2"
         >
           {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
@@ -744,12 +780,13 @@ function ProjectHeader({
         <Button
           variant="default"
           size="sm"
-          disabled={project.status !== "review"}
+          onClick={onGenerateBrief}
+          disabled={!canGenerate || generating}
           className="gap-2"
-          title={project.status !== "review" ? "Complete extraction first" : ""}
+          title={!canGenerate ? "Complete extraction first" : ""}
         >
-          <Sparkles className="w-4 h-4" />
-          Generate Brief
+          {generating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          {generating ? "Generating…" : project.status === "complete" ? "Regenerate Brief" : "Generate Brief"}
         </Button>
       </div>
     </div>

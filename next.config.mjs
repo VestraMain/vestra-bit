@@ -3,7 +3,6 @@ const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: [
       "unpdf",
-      "pdf-parse",
       "pdfjs-dist",
       "pdfkit",
       "canvas",

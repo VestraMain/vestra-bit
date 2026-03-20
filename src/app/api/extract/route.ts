@@ -70,57 +70,21 @@ const EXTRACTION_SCHEMA = `{
 }`;
 
 // ── PDF text extraction ───────────────────────────────────────────────────────
-// Strategy:
-//   1. Primary — unpdf: zero browser API dependencies, built for serverless
-//   2. Fallback — pdf-parse v2 PDFParse class: also works without DOMMatrix
-//
-// pdfjs-dist is intentionally NOT used here — it references DOMMatrix during
-// document loading in Vercel's Node.js runtime which throws even for the text
-// extraction code path. Keep pdfjs-dist only in export-jpg (where the
-// DOMMatrix polyfill is installed before import).
-async function extractPdfText(buffer: Buffer, label: string): Promise<string> {
-  // ── Primary: unpdf ────────────────────────────────────────────────────────
+// Uses unpdf exclusively. unpdf bundles pdfjs-dist with its own DOMMatrix
+// polyfill (globalThis.DOMMatrix = class {}) so it works on Vercel's Node.js
+// serverless runtime with zero browser API dependencies.
+// pdf-parse is intentionally not used — its v2 release uses pdfjs-dist as a
+// peer dep without the polyfill, causing "DOMMatrix is not defined" crashes.
+async function getPdfText(buffer: Buffer): Promise<string> {
   try {
     const { extractText } = await import("unpdf");
-    console.log(`[extract] unpdf: loading "${label}" (${buffer.byteLength} bytes)`);
-    const { text, totalPages } = await extractText(new Uint8Array(buffer), {
+    const { text } = await extractText(new Uint8Array(buffer), {
       mergePages: true,
     });
-    const trimmed = (text ?? "").trim();
-    console.log(
-      `[extract] unpdf: "${label}" — ${totalPages} page(s), ${trimmed.length} chars`
-    );
-    if (trimmed.length > 0) return trimmed;
-    // Fall through to fallback if text is empty (scanned/image PDF)
-    console.warn(`[extract] unpdf: "${label}" returned empty text — trying fallback`);
-  } catch (unpdfErr) {
-    console.error(
-      `[extract] unpdf failed for "${label}":`,
-      unpdfErr instanceof Error ? unpdfErr.message : String(unpdfErr)
-    );
-  }
-
-  // ── Fallback: pdf-parse v2 PDFParse class ─────────────────────────────────
-  try {
-    const { PDFParse } = await import("pdf-parse");
-    console.log(`[extract] pdf-parse fallback: loading "${label}"`);
-    const parser = new PDFParse({ data: new Uint8Array(buffer) });
-    const result = await parser.getText();
-    const pages: { text?: string }[] = Array.isArray(result?.pages)
-      ? result.pages
-      : [];
-    const text = pages
-      .map((p) => p.text ?? "")
-      .join("\n")
-      .trim();
-    console.log(
-      `[extract] pdf-parse fallback: "${label}" — ${pages.length} page(s), ${text.length} chars`
-    );
-    return text;
-  } catch (parseErr) {
-    const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-    console.error(`[extract] pdf-parse fallback also failed for "${label}":`, msg);
-    throw new Error(`Both extractors failed for "${label}": ${msg}`);
+    return text ?? "";
+  } catch (err) {
+    console.error("[extract] unpdf extraction error:", err);
+    return "";
   }
 }
 
@@ -192,24 +156,17 @@ export async function POST(req: NextRequest) {
       const buffer = Buffer.from(await fileData.arrayBuffer());
       console.log(`[extract] Downloaded "${filename}" — ${buffer.byteLength} bytes`);
 
-      try {
-        const text = await extractPdfText(buffer, filename);
-        if (!text) {
-          const msg = `"${filename}" yielded empty text (scanned/image-only PDF?)`;
-          console.warn(`[extract] ${msg}`);
-          fileErrors.push(msg);
-          textChunks.push(
-            `\n\n--- FILE: ${filename} ---\n[No extractable text — likely a scanned image PDF]`
-          );
-        } else {
-          textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
-        }
-      } catch (parseErr) {
-        const msg =
-          parseErr instanceof Error ? parseErr.message : String(parseErr);
-        console.error(`[extract] Parse error for "${filename}":`, msg);
+      const text = await getPdfText(buffer);
+      console.log(`[extract] "${filename}" — ${text.length} chars extracted`);
+      if (!text.trim()) {
+        const msg = `"${filename}" yielded empty text (scanned/image-only PDF?)`;
+        console.warn(`[extract] ${msg}`);
         fileErrors.push(msg);
-        // Continue with remaining files
+        textChunks.push(
+          `\n\n--- FILE: ${filename} ---\n[No extractable text — likely a scanned image PDF]`
+        );
+      } else {
+        textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
       }
     }
 

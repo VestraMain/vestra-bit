@@ -22,8 +22,6 @@ async function getSupabase() {
   );
 }
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 interface QAPair {
   question: string;
   answer: string;
@@ -134,6 +132,8 @@ Guidelines:
 - technical_talking_points: Key differentiators or capabilities to highlight when pitching for this contract
 - ideal_contractor_profile: Describe the perfect contractor for this bid (size, experience, certifications, location)
 - outreach_strategy: Tactical advice for pursuing this opportunity proactively`;
+
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const msg = await anthropic.messages.create({
     model: "claude-haiku-4-5-20251001",

@@ -69,52 +69,59 @@ const EXTRACTION_SCHEMA = `{
   "submission_forms_required": "List of required submission forms as string, or null"
 }`;
 
-// ── pdfjs-dist text extraction ────────────────────────────────────────────────
-// Uses pdfjs-dist legacy build (same package pdf-to-img relies on).
-// Resolves the worker path via createRequire so it works on Vercel where
-// __dirname is not a static file path.
+// ── PDF text extraction ───────────────────────────────────────────────────────
+// Strategy:
+//   1. Primary — unpdf: zero browser API dependencies, built for serverless
+//   2. Fallback — pdf-parse v2 PDFParse class: also works without DOMMatrix
+//
+// pdfjs-dist is intentionally NOT used here — it references DOMMatrix during
+// document loading in Vercel's Node.js runtime which throws even for the text
+// extraction code path. Keep pdfjs-dist only in export-jpg (where the
+// DOMMatrix polyfill is installed before import).
 async function extractPdfText(buffer: Buffer, label: string): Promise<string> {
-  const { createRequire } = await import("module");
-  const path = await import("path");
-
-  // Dynamic import of the ESM-only pdfjs-dist legacy build
-  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-
-  // Resolve worker path the same way pdf-to-img does
-  const r = createRequire(import.meta.url);
-  const pdfjsBase = path.dirname(r.resolve("pdfjs-dist/package.json"));
-  pdfjs.GlobalWorkerOptions.workerSrc = `${pdfjsBase}/legacy/build/pdf.worker.mjs`;
-
-  console.log(`[extract] Loading PDF "${label}" (${buffer.byteLength} bytes)`);
-
-  const loadingTask = pdfjs.getDocument({
-    data: new Uint8Array(buffer),
-    // Suppress the "Indexing all PDF objects" warning in logs
-    verbosity: 0,
-  });
-
-  const doc = await loadingTask.promise;
-  const numPages = doc.numPages;
-  console.log(`[extract] "${label}" has ${numPages} page(s)`);
-
-  const pageTexts: string[] = [];
-  for (let i = 1; i <= numPages; i++) {
-    const page = await doc.getPage(i);
-    const textContent = await page.getTextContent();
-    const pageText = textContent.items
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      .map((item: any) => ("str" in item ? (item.str as string) : ""))
-      .join(" ")
-      .replace(/\s{2,}/g, " ")
-      .trim();
-    pageTexts.push(pageText);
+  // ── Primary: unpdf ────────────────────────────────────────────────────────
+  try {
+    const { extractText } = await import("unpdf");
+    console.log(`[extract] unpdf: loading "${label}" (${buffer.byteLength} bytes)`);
+    const { text, totalPages } = await extractText(new Uint8Array(buffer), {
+      mergePages: true,
+    });
+    const trimmed = (text ?? "").trim();
+    console.log(
+      `[extract] unpdf: "${label}" — ${totalPages} page(s), ${trimmed.length} chars`
+    );
+    if (trimmed.length > 0) return trimmed;
+    // Fall through to fallback if text is empty (scanned/image PDF)
+    console.warn(`[extract] unpdf: "${label}" returned empty text — trying fallback`);
+  } catch (unpdfErr) {
+    console.error(
+      `[extract] unpdf failed for "${label}":`,
+      unpdfErr instanceof Error ? unpdfErr.message : String(unpdfErr)
+    );
   }
 
-  const fullText = pageTexts.join("\n");
-  console.log(
-    `[extract] "${label}" extracted ${fullText.length} chars across ${numPages} pages`
-  );
-  return fullText;
+  // ── Fallback: pdf-parse v2 PDFParse class ─────────────────────────────────
+  try {
+    const { PDFParse } = await import("pdf-parse");
+    console.log(`[extract] pdf-parse fallback: loading "${label}"`);
+    const parser = new PDFParse({ data: new Uint8Array(buffer) });
+    const result = await parser.getText();
+    const pages: { text?: string }[] = Array.isArray(result?.pages)
+      ? result.pages
+      : [];
+    const text = pages
+      .map((p) => p.text ?? "")
+      .join("\n")
+      .trim();
+    console.log(
+      `[extract] pdf-parse fallback: "${label}" — ${pages.length} page(s), ${text.length} chars`
+    );
+    return text;
+  } catch (parseErr) {
+    const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    console.error(`[extract] pdf-parse fallback also failed for "${label}":`, msg);
+    throw new Error(`Both extractors failed for "${label}": ${msg}`);
+  }
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
@@ -148,7 +155,10 @@ export async function POST(req: NextRequest) {
   }
 
   if (!project.source_files || project.source_files.length === 0) {
-    return NextResponse.json({ error: "No source files to extract from" }, { status: 400 });
+    return NextResponse.json(
+      { error: "No source files to extract from" },
+      { status: 400 }
+    );
   }
 
   console.log(`[extract] Found ${project.source_files.length} source file(s)`);
@@ -166,14 +176,14 @@ export async function POST(req: NextRequest) {
 
     for (const filePath of project.source_files as string[]) {
       const filename = filePath.split("/").pop() ?? filePath;
-      console.log(`[extract] Downloading file: ${filePath}`);
+      console.log(`[extract] Downloading: ${filePath}`);
 
       const { data: fileData, error: dlErr } = await supabase.storage
         .from("project-files")
         .download(filePath);
 
       if (dlErr || !fileData) {
-        const msg = `Download failed for "${filename}": ${dlErr?.message ?? "no data returned"}`;
+        const msg = `Download failed for "${filename}": ${dlErr?.message ?? "no data"}`;
         console.error(`[extract] ${msg}`);
         fileErrors.push(msg);
         continue;
@@ -184,20 +194,22 @@ export async function POST(req: NextRequest) {
 
       try {
         const text = await extractPdfText(buffer, filename);
-        if (!text || text.trim().length === 0) {
+        if (!text) {
           const msg = `"${filename}" yielded empty text (scanned/image-only PDF?)`;
           console.warn(`[extract] ${msg}`);
           fileErrors.push(msg);
-          // Still include a placeholder so Claude knows the file existed
-          textChunks.push(`\n\n--- FILE: ${filename} ---\n[No extractable text — may be a scanned image PDF]`);
+          textChunks.push(
+            `\n\n--- FILE: ${filename} ---\n[No extractable text — likely a scanned image PDF]`
+          );
         } else {
           textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
         }
       } catch (parseErr) {
-        const msg = `PDF parse error for "${filename}": ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`;
-        console.error(`[extract] ${msg}`);
+        const msg =
+          parseErr instanceof Error ? parseErr.message : String(parseErr);
+        console.error(`[extract] Parse error for "${filename}":`, msg);
         fileErrors.push(msg);
-        // Continue with other files
+        // Continue with remaining files
       }
     }
 
@@ -208,19 +220,16 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Concatenate and truncate to stay within Claude's context window
     const combined = textChunks.join("\n").slice(0, 180_000);
     console.log(
-      `[extract] Total combined text: ${combined.length} chars from ${textChunks.length}/${project.source_files.length} files. ` +
-        (fileErrors.length ? `Partial errors: ${fileErrors.join(" | ")}` : "No errors.")
+      `[extract] Combined text: ${combined.length} chars from ` +
+        `${textChunks.length}/${project.source_files.length} file(s).` +
+        (fileErrors.length ? ` Partial errors: ${fileErrors.join(" | ")}` : "")
     );
 
     // ── Step 2: Call Claude ─────────────────────────────────────────────────
     console.log(`[extract] Sending ${combined.length} chars to Claude`);
-
-    const anthropic = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    });
+    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
@@ -247,8 +256,8 @@ export async function POST(req: NextRequest) {
     console.log(`[extract] Claude responded. Stop reason: ${message.stop_reason}`);
 
     // ── Step 3: Parse + validate Claude's response ─────────────────────────
-    const raw = message.content[0].type === "text" ? message.content[0].text : "";
-
+    const raw =
+      message.content[0].type === "text" ? message.content[0].text : "";
     const cleaned = raw
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")
@@ -259,12 +268,13 @@ export async function POST(req: NextRequest) {
       extracted = JSON.parse(cleaned);
     } catch {
       throw new Error(
-        `Claude returned invalid JSON. Raw response (first 500 chars): ${raw.slice(0, 500)}`
+        `Claude returned invalid JSON. Raw (first 500 chars): ${raw.slice(0, 500)}`
       );
     }
 
     if (!Array.isArray(extracted.work_items)) extracted.work_items = [];
-    if (!Array.isArray(extracted.insurance_requirements)) extracted.insurance_requirements = [];
+    if (!Array.isArray(extracted.insurance_requirements))
+      extracted.insurance_requirements = [];
 
     // ── Step 4: Save to DB ─────────────────────────────────────────────────
     const { error: updateErr } = await supabase
@@ -284,7 +294,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ success: true, extracted_data: extracted });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Extraction failed";
-    console.error(`[extract] FATAL error for project ${projectId}:`, errMsg);
+    console.error(`[extract] FATAL for project ${projectId}:`, errMsg);
 
     await supabase
       .from("projects")

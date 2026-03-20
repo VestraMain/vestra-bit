@@ -22,8 +22,6 @@ async function getSupabase() {
   );
 }
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 interface SocialPlatformContent {
   en: string;
   es: string;
@@ -110,6 +108,8 @@ Datos del Contrato:
 ${dataContext}
 
 Devuelve SOLO el texto del post, sin explicaciones ni metadatos.`;
+
+  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
   const [enMsg, esMsg] = await Promise.all([
     anthropic.messages.create({

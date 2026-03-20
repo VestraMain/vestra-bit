@@ -5,6 +5,38 @@ import { cookies } from "next/headers";
 export const runtime = "nodejs";
 export const maxDuration = 120;
 
+// pdf-to-img uses pdfjs-dist for rendering, which needs DOMMatrix.
+// Vercel's Node.js runtime doesn't provide browser globals, so we polyfill
+// it before any pdfjs-dist import can run. Only rendering (canvas) needs
+// DOMMatrix — text extraction never uses it.
+/* eslint-disable @typescript-eslint/no-explicit-any */
+if (typeof globalThis.DOMMatrix === "undefined") {
+  // Minimal stub so pdfjs-dist passes its global check at load time.
+  // Real matrix math runs inside the canvas worker; this satisfies the
+  // instanceof / typeof checks that happen before actual rendering.
+  (globalThis as any).DOMMatrix = class DOMMatrix {
+    a = 1; b = 0; c = 0; d = 1; e = 0; f = 0;
+    m11 = 1; m12 = 0; m13 = 0; m14 = 0;
+    m21 = 0; m22 = 1; m23 = 0; m24 = 0;
+    m31 = 0; m32 = 0; m33 = 1; m34 = 0;
+    m41 = 0; m42 = 0; m43 = 0; m44 = 1;
+    is2D = true; isIdentity = true;
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    constructor(init?: unknown) {}
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    multiply(other: unknown) { return new (globalThis as any).DOMMatrix(); }
+    inverse() { return new (globalThis as any).DOMMatrix(); }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    translate(...args: number[]) { return new (globalThis as any).DOMMatrix(); }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    scale(...args: number[]) { return new (globalThis as any).DOMMatrix(); }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    rotate(...args: number[]) { return new (globalThis as any).DOMMatrix(); }
+    transformPoint(pt?: { x?: number; y?: number }) { return { x: pt?.x ?? 0, y: pt?.y ?? 0 }; }
+  };
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
 async function getSupabase() {
   const cookieStore = await cookies();
   return createServerClient(

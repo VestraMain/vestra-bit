@@ -5,18 +5,17 @@ import { cookies } from "next/headers";
 export const runtime = "nodejs";
 export const maxDuration = 30;
 
-// Minimal valid 1-page PDF with a text string ("Hello")
-// Generated with: python3 -c "import base64; ..."
+// Minimal valid 1-page PDF with a "Hello World" text string
 const MINIMAL_PDF_B64 =
-  "JVBERi0xLjAKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqIDIgMCBv" +
+  "JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZy9QYWdlcyAyIDAgUj4+ZW5kb2JqIDIgMCBv" +
   "Ymk8PC9UeXBlL1BhZ2VzL0tpZHNbMyAwIFJdL0NvdW50IDE+PmVuZG9iaiAzIDAgb2JqPDwvVHlw" +
   "ZS9QYWdlL01lZGlhQm94WzAgMCA2MTIgNzkyXS9SZXNvdXJjZXM8PC9Gb250PDwvRjE8PC9UeXBl" +
   "L0ZvbnQvU3VidHlwZS9UeXBlMS9CYXNlRm9udC9IZWx2ZXRpY2E+Pj4+Pj4vQ29udGVudHMgNCAw" +
-  "IFI+PmVuZG9iaiA0IDAgb2JqPDwvTGVuZ3RoIDQ0Pj5zdHJlYW0KQlQKL0YxIDEyIFRmCjcyIDcw" +
-  "MCBUZAooSGVsbG8gV29ybGQpIFRqCkVUCmVuZHN0cmVhbQplbmRvYmoKeHJlZgowIDUKMDAwMDAw" +
-  "MDAwMCA2NTUzNSBmCjAwMDAwMDAwMDkgMDAwMDAgbgowMDAwMDAwMDU4IDAwMDAwIG4KMDAwMDAwMDEx" +
-  "NSAwMDAwMCBuCjAwMDAwMDAyOTAgMDAwMDAgbgp0cmFpbGVyPDwvU2l6ZSA1L1Jvb3QgMSAwIFI+" +
-  "PgpzdGFydHhyZWYKMzg0CiUlRU9G";
+  "IFIvUGFyZW50IDIgMCBSPj5lbmRvYmogNCAwIG9iajw8L0xlbmd0aCA0ND4+c3RyZWFtCkJUCi9G" +
+  "MSAxMiBUZgo3MiA3MjAgVGQKKEhlbGxvIFdvcmxkKSBUagpFVAplbmRzdHJlYW0KZW5kb2JqCnhy" +
+  "ZWYKMCA1CjAwMDAwMDAwMDAgNjU1MzUgZgowMDAwMDAwMDA5IDAwMDAwIG4KMDAwMDAwMDA1OCAw" +
+  "MDAwMCBuCjAwMDAwMDAxMTUgMDAwMDAgbgowMDAwMDAwMjk4IDAwMDAwIG4KdHJhaWxlcjw8L1Np" +
+  "emUgNS9Sb290IDEgMCBSPj4Kc3RhcnR4cmVmCjM5MgolJUVPRg==";
 
 interface CheckResult {
   ok: boolean;
@@ -27,18 +26,25 @@ interface CheckResult {
 export async function GET() {
   const results: Record<string, CheckResult> = {};
 
-  // ── Check 1: ANTHROPIC_API_KEY is set ────────────────────────────────────
+  // ── Check 1: ANTHROPIC_API_KEY ────────────────────────────────────────────
   const apiKey = process.env.ANTHROPIC_API_KEY;
   results.anthropic_api_key = apiKey
     ? { ok: true, detail: `Set (length: ${apiKey.length}, prefix: ${apiKey.slice(0, 7)}…)` }
     : { ok: false, detail: "NOT set — ANTHROPIC_API_KEY env var is missing", error: "Missing env var" };
 
-  // ── Check 2: Supabase Storage reachability ───────────────────────────────
+  // ── Check 2: Supabase env vars ────────────────────────────────────────────
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  results.supabase_env = (supabaseUrl && supabaseKey)
+    ? { ok: true, detail: `URL: ${supabaseUrl}` }
+    : { ok: false, detail: "Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY", error: "Missing env vars" };
+
+  // ── Check 3: Supabase Storage reachability ────────────────────────────────
   try {
     const cookieStore = await cookies();
     const supabase = createServerClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      supabaseUrl!,
+      supabaseKey!,
       {
         cookies: {
           getAll: () => cookieStore.getAll(),
@@ -53,23 +59,13 @@ export async function GET() {
       }
     );
 
-    // List the root of the project-files bucket (lightweight check)
     const { data, error } = await supabase.storage
       .from("project-files")
       .list("", { limit: 1 });
 
-    if (error) {
-      results.supabase_storage = {
-        ok: false,
-        detail: `Bucket list failed: ${error.message}`,
-        error: error.message,
-      };
-    } else {
-      results.supabase_storage = {
-        ok: true,
-        detail: `Reachable. Found ${data?.length ?? 0} item(s) at bucket root.`,
-      };
-    }
+    results.supabase_storage = error
+      ? { ok: false, detail: `Bucket list failed: ${error.message}`, error: error.message }
+      : { ok: true, detail: `Reachable. Found ${data?.length ?? 0} item(s) at bucket root.` };
   } catch (e) {
     results.supabase_storage = {
       ok: false,
@@ -78,62 +74,69 @@ export async function GET() {
     };
   }
 
-  // ── Check 3: pdfjs-dist can load and extract text from a PDF buffer ───────
+  // ── Check 4: unpdf (primary extractor) ───────────────────────────────────
   try {
-    const { createRequire } = await import("module");
-    const path = await import("path");
-    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-
-    const r = createRequire(import.meta.url);
-    const pdfjsBase = path.dirname(r.resolve("pdfjs-dist/package.json"));
-    const workerPath = `${pdfjsBase}/legacy/build/pdf.worker.mjs`;
-    pdfjs.GlobalWorkerOptions.workerSrc = workerPath;
-
+    const { extractText } = await import("unpdf");
     const pdfBuffer = Buffer.from(MINIMAL_PDF_B64, "base64");
-    const loadingTask = pdfjs.getDocument({
-      data: new Uint8Array(pdfBuffer),
-      verbosity: 0,
+    const { text, totalPages } = await extractText(new Uint8Array(pdfBuffer), {
+      mergePages: true,
     });
-    const doc = await loadingTask.promise;
-    const numPages = doc.numPages;
-
-    // Extract text from page 1
-    const page = await doc.getPage(1);
-    const tc = await page.getTextContent();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const text = tc.items.map((it: any) => ("str" in it ? it.str : "")).join(" ").trim();
-
-    results.pdfjs_text_extraction = {
+    const extracted = (text ?? "").trim();
+    results.unpdf_extraction = {
       ok: true,
-      detail: `Loaded ${numPages} page(s). Extracted text: "${text || "(empty — test PDF may have no text layer)"}"`,
+      detail: `Loaded ${totalPages} page(s). Extracted: "${extracted || "(empty)"}"`,
     };
   } catch (e) {
-    results.pdfjs_text_extraction = {
+    results.unpdf_extraction = {
       ok: false,
-      detail: "pdfjs-dist text extraction failed",
+      detail: "unpdf extraction failed",
       error: e instanceof Error ? e.message : String(e),
     };
   }
 
-  // ── Check 4: Node.js runtime info ────────────────────────────────────────
+  // ── Check 5: pdf-parse PDFParse (fallback extractor) ─────────────────────
+  try {
+    const { PDFParse } = await import("pdf-parse");
+    const pdfBuffer = Buffer.from(MINIMAL_PDF_B64, "base64");
+    const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) });
+    const result = await parser.getText();
+    const pages: { text?: string }[] = Array.isArray(result?.pages) ? result.pages : [];
+    const text = pages.map((p) => p.text ?? "").join(" ").trim();
+    results.pdf_parse_extraction = {
+      ok: true,
+      detail: `Loaded ${pages.length} page(s). Extracted: "${text || "(empty)"}"`,
+    };
+  } catch (e) {
+    results.pdf_parse_extraction = {
+      ok: false,
+      detail: "pdf-parse PDFParse fallback failed",
+      error: e instanceof Error ? e.message : String(e),
+    };
+  }
+
+  // ── Check 6: DOMMatrix availability (needed by pdfjs-dist for JPG export) ─
+  results.dom_matrix = typeof globalThis.DOMMatrix !== "undefined"
+    ? { ok: true, detail: "DOMMatrix is available in this runtime" }
+    : { ok: false, detail: "DOMMatrix is NOT defined — export-jpg polyfill will handle this", error: "Missing browser global (expected on Vercel Node.js)" };
+
+  // ── Check 7: Node.js runtime info ─────────────────────────────────────────
   results.runtime_info = {
     ok: true,
     detail: `Node.js ${process.version} | Platform: ${process.platform} | Arch: ${process.arch}`,
   };
 
-  // ── Check 5: NEXT_PUBLIC_SUPABASE_URL is set ─────────────────────────────
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  results.supabase_url = supabaseUrl
-    ? { ok: true, detail: `Set: ${supabaseUrl}` }
-    : { ok: false, detail: "NEXT_PUBLIC_SUPABASE_URL is not set", error: "Missing env var" };
-
-  const allOk = Object.values(results).every((r) => r.ok);
+  const allCriticalOk =
+    results.anthropic_api_key.ok &&
+    results.supabase_env.ok &&
+    results.supabase_storage.ok &&
+    results.unpdf_extraction.ok;
 
   return NextResponse.json(
     {
-      status: allOk ? "all_ok" : "issues_found",
+      status: allCriticalOk ? "all_ok" : "issues_found",
+      note: "dom_matrix failure is expected on Vercel Node.js — the export-jpg route installs a polyfill",
       checks: results,
     },
-    { status: allOk ? 200 : 500 }
+    { status: allCriticalOk ? 200 : 500 }
   );
 }

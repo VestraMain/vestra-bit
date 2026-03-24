@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import { buildBriefPDF } from "@/lib/brief/buildBriefPDF";
 
 export const runtime = "nodejs";
@@ -23,36 +23,28 @@ async function getSupabase() {
   );
 }
 
-// ── Translate extracted_data to Spanish via Claude Haiku ──────────────────────
+// ── Translate extracted_data to Spanish via Gemini Flash ─────────────────────
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function translateData(data: Record<string, any>): Promise<Record<string, any>> {
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
   // Only send the prose fields — structured data (dates, numbers, codes) stays untouched
-  const message = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 4096,
-    system:
-      "You are a bilingual government contracting specialist. Translate the provided " +
-      "English JSON content into professional Mexican-American Spanish. Rules:\n" +
-      "- Translate human-readable text naturally and professionally\n" +
-      "- NEVER translate: proper nouns, organization names, bid numbers, dollar amounts, " +
-      "dates, addresses, legal code references, NAICS codes, product model numbers, or measurement values\n" +
-      "- Key terms: Licitación (Bid), Fianza de Licitación (Bid Bond), " +
-      "Terminación Sustancial (Substantial Completion), Daños y Perjuicios Pactados (Liquidated Damages)\n" +
-      "- Return a JSON object with IDENTICAL keys and structure. Null values stay null.\n" +
-      "- Return ONLY valid JSON with no markdown, no code blocks, no explanation.",
-    messages: [
-      {
-        role: "user",
-        content:
-          "Translate the following procurement data JSON to professional Mexican-American Spanish. " +
-          "Return ONLY valid JSON with the same structure:\n\n" + JSON.stringify(data, null, 2),
-      },
-    ],
-  });
+  const result = await model.generateContent(
+    "You are a bilingual government contracting specialist. Translate the provided " +
+    "English JSON content into professional Mexican-American Spanish. Rules:\n" +
+    "- Translate human-readable text naturally and professionally\n" +
+    "- NEVER translate: proper nouns, organization names, bid numbers, dollar amounts, " +
+    "dates, addresses, legal code references, NAICS codes, product model numbers, or measurement values\n" +
+    "- Key terms: Licitación (Bid), Fianza de Licitación (Bid Bond), " +
+    "Terminación Sustancial (Substantial Completion), Daños y Perjuicios Pactados (Liquidated Damages)\n" +
+    "- Return a JSON object with IDENTICAL keys and structure. Null values stay null.\n" +
+    "- Return ONLY valid JSON with no markdown, no code blocks, no explanation.\n\n" +
+    "Translate the following procurement data JSON to professional Mexican-American Spanish. " +
+    "Return ONLY valid JSON with the same structure:\n\n" + JSON.stringify(data, null, 2)
+  );
 
-  const raw = message.content[0].type === "text" ? message.content[0].text : "";
+  const raw = result.response.text();
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
 
   try {

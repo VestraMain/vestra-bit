@@ -27,7 +27,7 @@ async function getSupabaseClient() {
   );
 }
 
-// ── Extraction JSON schema sent to Claude ────────────────────────────────────
+// ── Extraction JSON schema sent to Gemini ─────────────────────────────────────
 const EXTRACTION_SCHEMA = `{
   "owner": "Issuing agency / owner name, or null",
   "bid_number": "Bid/RFP/IFB reference number, or null",
@@ -73,8 +73,6 @@ const EXTRACTION_SCHEMA = `{
 // Uses unpdf exclusively. unpdf bundles pdfjs-dist with its own DOMMatrix
 // polyfill (globalThis.DOMMatrix = class {}) so it works on Vercel's Node.js
 // serverless runtime with zero browser API dependencies.
-// pdf-parse is intentionally not used — its v2 release uses pdfjs-dist as a
-// peer dep without the polyfill, causing "DOMMatrix is not defined" crashes.
 async function getPdfText(buffer: Buffer): Promise<string> {
   try {
     const { extractText } = await import("unpdf");
@@ -86,6 +84,37 @@ async function getPdfText(buffer: Buffer): Promise<string> {
     console.error("[extract] unpdf extraction error:", err);
     return "";
   }
+}
+
+// ── Gemini call with 429 retry logic ─────────────────────────────────────────
+// Free-tier rate limit: retries up to 3 times with a 20-second backoff.
+async function callGeminiWithRetry(
+  model: ReturnType<InstanceType<typeof GoogleGenerativeAI>["getGenerativeModel"]>,
+  prompt: string,
+  filename: string
+): Promise<string> {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY_MS = 20_000;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const result = await model.generateContent(prompt);
+      return result.response.text();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const is429 = msg.includes("429") || msg.toLowerCase().includes("quota") || msg.toLowerCase().includes("rate");
+      if (is429 && attempt < MAX_RETRIES) {
+        console.warn(
+          `[extract] "${filename}" — 429 rate limit hit (attempt ${attempt}/${MAX_RETRIES}). ` +
+          `Waiting ${RETRY_DELAY_MS / 1000}s before retry…`
+        );
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`Gemini call failed after ${MAX_RETRIES} attempts`);
 }
 
 // ── Main handler ─────────────────────────────────────────────────────────────
@@ -134,13 +163,22 @@ export async function POST(req: NextRequest) {
     .eq("id", projectId);
 
   try {
-    // ── Step 1: Download + extract text from each PDF ──────────────────────
-    const textChunks: string[] = [];
-    const fileErrors: string[] = [];
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+    // gemini-2.0-flash-lite: higher free-tier RPM quota than gemini-2.0-flash
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-lite" });
 
-    for (const filePath of project.source_files as string[]) {
+    // Merged extracted data across all files — later files fill in nulls from earlier ones
+    let merged: Record<string, unknown> = {};
+    const fileErrors: string[] = [];
+    let successCount = 0;
+
+    // ── Process each PDF individually ──────────────────────────────────────
+    const sourceFiles = project.source_files as string[];
+    for (let i = 0; i < sourceFiles.length; i++) {
+      const filePath = sourceFiles[i];
       const filename = filePath.split("/").pop() ?? filePath;
-      console.log(`[extract] Downloading: ${filePath}`);
+
+      console.log(`[extract] Downloading (${i + 1}/${sourceFiles.length}): ${filePath}`);
 
       const { data: fileData, error: dlErr } = await supabase.storage
         .from("project-files")
@@ -156,81 +194,89 @@ export async function POST(req: NextRequest) {
       const buffer = Buffer.from(await fileData.arrayBuffer());
       console.log(`[extract] Downloaded "${filename}" — ${buffer.byteLength} bytes`);
 
-      const text = await getPdfText(buffer);
-      console.log(`[extract] "${filename}" — ${text.length} chars extracted`);
-      if (!text.trim()) {
+      const fullText = await getPdfText(buffer);
+      if (!fullText.trim()) {
         const msg = `"${filename}" yielded empty text (scanned/image-only PDF?)`;
         console.warn(`[extract] ${msg}`);
         fileErrors.push(msg);
-        textChunks.push(
-          `\n\n--- FILE: ${filename} ---\n[No extractable text — likely a scanned image PDF]`
-        );
-      } else {
-        textChunks.push(`\n\n--- FILE: ${filename} ---\n${text}`);
+        continue;
       }
+
+      // Limit to first 15,000 chars — government RFPs front-load key fields
+      const text = fullText.slice(0, 15_000);
+      console.log(
+        `[extract] "${filename}" — ${fullText.length} chars extracted, sending first ${text.length}`
+      );
+
+      // 5-second inter-file delay (skip before the first file)
+      if (i > 0) {
+        console.log(`[extract] Waiting 5s before next Gemini call…`);
+        await new Promise((r) => setTimeout(r, 5_000));
+      }
+
+      const prompt =
+        "You are a government procurement analyst. Extract fields from the " +
+        "provided RFP document and return a single valid JSON object. " +
+        "CRITICAL: If you cannot find a field, set it to null. Never " +
+        "fabricate, estimate, or infer values. Return ONLY valid JSON with " +
+        "no markdown fences, no code blocks, and no explanatory text.\n\n" +
+        `Extract all procurement fields from the following RFP document text. ` +
+        `Return ONLY a valid JSON object matching this schema exactly:\n\n` +
+        `${EXTRACTION_SCHEMA}\n\n` +
+        `For work_items and insurance_requirements, return empty arrays [] if none found.\n\n` +
+        `Document text:\n${text}`;
+
+      console.log(`[extract] Sending "${filename}" to Gemini…`);
+      const raw = await callGeminiWithRetry(model, prompt, filename);
+      console.log(`[extract] Gemini responded for "${filename}".`);
+
+      const cleaned = raw
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```\s*$/i, "")
+        .trim();
+
+      let fileData2: Record<string, unknown>;
+      try {
+        fileData2 = JSON.parse(cleaned);
+      } catch {
+        console.warn(
+          `[extract] "${filename}" returned invalid JSON — skipping. ` +
+          `Raw (first 200 chars): ${raw.slice(0, 200)}`
+        );
+        fileErrors.push(`"${filename}" returned invalid JSON from Gemini`);
+        continue;
+      }
+
+      // Merge: first file seeds the object; subsequent files fill in only null fields
+      if (successCount === 0) {
+        merged = fileData2;
+      } else {
+        for (const key of Object.keys(fileData2)) {
+          if (merged[key] === null || merged[key] === undefined) {
+            merged[key] = fileData2[key];
+          }
+        }
+      }
+      successCount++;
     }
 
-    if (textChunks.length === 0) {
+    if (successCount === 0) {
       throw new Error(
-        `Could not extract text from any of the ${project.source_files.length} file(s). ` +
+        `Could not extract data from any of the ${sourceFiles.length} file(s). ` +
           `Errors: ${fileErrors.join(" | ")}`
       );
     }
 
-    const combined = textChunks.join("\n").slice(0, 180_000);
-    console.log(
-      `[extract] Combined text: ${combined.length} chars from ` +
-        `${textChunks.length}/${project.source_files.length} file(s).` +
-        (fileErrors.length ? ` Partial errors: ${fileErrors.join(" | ")}` : "")
-    );
+    if (!Array.isArray(merged.work_items)) merged.work_items = [];
+    if (!Array.isArray(merged.insurance_requirements)) merged.insurance_requirements = [];
 
-    // ── Step 2: Call Gemini ─────────────────────────────────────────────────
-    console.log(`[extract] Sending ${combined.length} chars to Gemini`);
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
-
-    const result = await model.generateContent(
-      "You are a government procurement analyst. Extract fields from the " +
-      "provided RFP documents and return a single valid JSON object. " +
-      "CRITICAL: If you cannot find a field, set it to null. Never " +
-      "fabricate, estimate, or infer values. Return ONLY valid JSON with " +
-      "no markdown fences, no code blocks, and no explanatory text.\n\n" +
-      `Extract all procurement fields from the following RFP document text. ` +
-      `Return ONLY a valid JSON object matching this schema exactly:\n\n` +
-      `${EXTRACTION_SCHEMA}\n\n` +
-      `For work_items and insurance_requirements, return empty arrays [] if none found.\n\n` +
-      `Document text:\n${combined}`
-    );
-
-    console.log(`[extract] Gemini responded.`);
-
-    // ── Step 3: Parse + validate Gemini's response ──────────────────────────
-    const raw = result.response.text();
-    const cleaned = raw
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
-      .trim();
-
-    let extracted: Record<string, unknown>;
-    try {
-      extracted = JSON.parse(cleaned);
-    } catch {
-      throw new Error(
-        `Claude returned invalid JSON. Raw (first 500 chars): ${raw.slice(0, 500)}`
-      );
-    }
-
-    if (!Array.isArray(extracted.work_items)) extracted.work_items = [];
-    if (!Array.isArray(extracted.insurance_requirements))
-      extracted.insurance_requirements = [];
-
-    // ── Step 4: Save to DB ─────────────────────────────────────────────────
+    // ── Save to DB ─────────────────────────────────────────────────────────
     const { error: updateErr } = await supabase
       .from("projects")
       .update({
-        extracted_data: extracted,
+        extracted_data: merged,
         status: "review",
-        ...(extracted.bid_deadline && !project.bid_deadline
+        ...(merged.bid_deadline && !project.bid_deadline
           ? { bid_deadline: null }
           : {}),
       })
@@ -238,8 +284,12 @@ export async function POST(req: NextRequest) {
 
     if (updateErr) throw new Error(`DB update failed: ${updateErr.message}`);
 
-    console.log(`[extract] Done. Project ${projectId} → status: review`);
-    return NextResponse.json({ success: true, extracted_data: extracted });
+    console.log(
+      `[extract] Done. Project ${projectId} → status: review. ` +
+      `Processed ${successCount}/${sourceFiles.length} file(s).` +
+      (fileErrors.length ? ` Partial errors: ${fileErrors.join(" | ")}` : "")
+    );
+    return NextResponse.json({ success: true, extracted_data: merged });
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Extraction failed";
     console.error(`[extract] FATAL for project ${projectId}:`, errMsg);

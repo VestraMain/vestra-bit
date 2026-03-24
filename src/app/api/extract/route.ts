@@ -187,7 +187,7 @@ export async function POST(req: NextRequest) {
     // ── Step 2: Call Gemini ─────────────────────────────────────────────────
     console.log(`[extract] Sending ${combined.length} chars to Gemini`);
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
     const result = await model.generateContent(
       "You are a government procurement analyst. Extract fields from the " +

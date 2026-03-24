@@ -110,7 +110,7 @@ ${dataContext}
 Devuelve SOLO el texto del post, sin explicaciones ni metadatos.`;
 
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   const [enResult, esResult] = await Promise.all([
     model.generateContent(enPrompt),

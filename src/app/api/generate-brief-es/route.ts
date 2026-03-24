@@ -27,7 +27,7 @@ async function getSupabase() {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function translateData(data: Record<string, any>): Promise<Record<string, any>> {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
-  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+  const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
 
   // Only send the prose fields — structured data (dates, numbers, codes) stays untouched
   const result = await model.generateContent(

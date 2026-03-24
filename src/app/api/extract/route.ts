@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -184,37 +184,28 @@ export async function POST(req: NextRequest) {
         (fileErrors.length ? ` Partial errors: ${fileErrors.join(" | ")}` : "")
     );
 
-    // ── Step 2: Call Claude ─────────────────────────────────────────────────
-    console.log(`[extract] Sending ${combined.length} chars to Claude`);
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+    // ── Step 2: Call Gemini ─────────────────────────────────────────────────
+    console.log(`[extract] Sending ${combined.length} chars to Gemini`);
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro" });
 
-    const message = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 4096,
-      system:
-        "You are a government procurement analyst. Extract fields from the " +
-        "provided RFP documents and return a single valid JSON object. " +
-        "CRITICAL: If you cannot find a field, set it to null. Never " +
-        "fabricate, estimate, or infer values. Return ONLY valid JSON with " +
-        "no markdown fences, no code blocks, and no explanatory text.",
-      messages: [
-        {
-          role: "user",
-          content:
-            `Extract all procurement fields from the following RFP document text. ` +
-            `Return ONLY a valid JSON object matching this schema exactly:\n\n` +
-            `${EXTRACTION_SCHEMA}\n\n` +
-            `For work_items and insurance_requirements, return empty arrays [] if none found.\n\n` +
-            `Document text:\n${combined}`,
-        },
-      ],
-    });
+    const result = await model.generateContent(
+      "You are a government procurement analyst. Extract fields from the " +
+      "provided RFP documents and return a single valid JSON object. " +
+      "CRITICAL: If you cannot find a field, set it to null. Never " +
+      "fabricate, estimate, or infer values. Return ONLY valid JSON with " +
+      "no markdown fences, no code blocks, and no explanatory text.\n\n" +
+      `Extract all procurement fields from the following RFP document text. ` +
+      `Return ONLY a valid JSON object matching this schema exactly:\n\n` +
+      `${EXTRACTION_SCHEMA}\n\n` +
+      `For work_items and insurance_requirements, return empty arrays [] if none found.\n\n` +
+      `Document text:\n${combined}`
+    );
 
-    console.log(`[extract] Claude responded. Stop reason: ${message.stop_reason}`);
+    console.log(`[extract] Gemini responded.`);
 
-    // ── Step 3: Parse + validate Claude's response ─────────────────────────
-    const raw =
-      message.content[0].type === "text" ? message.content[0].text : "";
+    // ── Step 3: Parse + validate Gemini's response ──────────────────────────
+    const raw = result.response.text();
     const cleaned = raw
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```\s*$/i, "")

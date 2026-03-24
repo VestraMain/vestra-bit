@@ -40,11 +40,11 @@ interface CheckResult {
 export async function GET() {
   const results: Record<string, CheckResult> = {};
 
-  // ── Check 1: ANTHROPIC_API_KEY ────────────────────────────────────────────
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  results.anthropic_api_key = apiKey
+  // ── Check 1: GEMINI_API_KEY ───────────────────────────────────────────────
+  const apiKey = process.env.GEMINI_API_KEY;
+  results.gemini_api_key = apiKey
     ? { ok: true, detail: `Set (length: ${apiKey.length}, prefix: ${apiKey.slice(0, 7)}…)` }
-    : { ok: false, detail: "NOT set — ANTHROPIC_API_KEY env var is missing", error: "Missing env var" };
+    : { ok: false, detail: "NOT set — GEMINI_API_KEY env var is missing", error: "Missing env var" };
 
   // ── Check 2: Supabase env vars ────────────────────────────────────────────
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -101,7 +101,7 @@ export async function GET() {
   };
 
   const allCriticalOk =
-    results.anthropic_api_key.ok &&
+    results.gemini_api_key.ok &&
     results.supabase_env.ok &&
     results.supabase_storage.ok &&
     results.unpdf_extraction.ok;

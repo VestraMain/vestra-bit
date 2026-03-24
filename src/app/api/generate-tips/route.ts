@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -133,15 +133,11 @@ Guidelines:
 - ideal_contractor_profile: Describe the perfect contractor for this bid (size, experience, certifications, location)
 - outreach_strategy: Tactical advice for pursuing this opportunity proactively`;
 
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-  const msg = await anthropic.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 1500,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const rawText = msg.content[0].type === "text" ? msg.content[0].text.trim() : "{}";
+  const result = await model.generateContent(prompt);
+  const rawText = result.response.text().trim() || "{}";
 
   let teamTips: TeamTips;
   try {

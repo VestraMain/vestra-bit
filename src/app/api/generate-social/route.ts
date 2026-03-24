@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 export const runtime = "nodejs";
 export const maxDuration = 120;
@@ -109,23 +109,16 @@ ${dataContext}
 
 Devuelve SOLO el texto del post, sin explicaciones ni metadatos.`;
 
-  const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+  const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-  const [enMsg, esMsg] = await Promise.all([
-    anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 600,
-      messages: [{ role: "user", content: enPrompt }],
-    }),
-    anthropic.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 600,
-      messages: [{ role: "user", content: esPrompt }],
-    }),
+  const [enResult, esResult] = await Promise.all([
+    model.generateContent(enPrompt),
+    model.generateContent(esPrompt),
   ]);
 
-  const en = enMsg.content[0].type === "text" ? enMsg.content[0].text.trim() : "";
-  const es = esMsg.content[0].type === "text" ? esMsg.content[0].text.trim() : "";
+  const en = enResult.response.text().trim();
+  const es = esResult.response.text().trim();
 
   return { en, es };
 }
